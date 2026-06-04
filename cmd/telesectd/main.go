@@ -28,6 +28,18 @@ func main() {
 	// Allow the background server a few milliseconds to bind to the port cleanly
 	time.Sleep(50 * time.Millisecond)
 
+	// ─── NEW: MASTER ROUTER CONSUMER LOOP ───
+	// Technical: This background goroutine constantly drains the central InboundRouter channel.
+	// Analogy: The worker at the end of the conveyor belt taking the inspected boxes and processing them.
+	go func() {
+		for packet := range srv.InboundRouter {
+			fmt.Printf("[Core Router] Packet Ingress -> Type: 0x%02x | Sizing: %d bytes\n", packet.Type, packet.Length)
+			if packet.Length > 0 {
+				fmt.Printf("[Payload Content] -> %s\n", string(packet.Value))
+			}
+		}
+	}()
+
 	// ─── MILESTONE 1.3: SYSTEM INTERRUPT TRAP ───
 	// Technical: Create a buffered channel capable of holding 1 operating system signal token.
 	sigChan := make(chan os.Signal, 1)

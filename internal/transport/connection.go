@@ -2,9 +2,12 @@ package transport
 
 import (
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"time"
+
+	"telesect/pkg/protocol"
 )
 
 var ErrConnectionClosed = errors.New("transport: connection closed")
@@ -20,9 +23,10 @@ type Connection struct {
 	closeOnce  sync.Once     // Technical: Prevents multiple close operations. Analogy: A single-use safety clamp.
 	closedChan chan struct{} // Technical: Broadcast coordination channel. Analogy: The truck's dashboard alarm siren.
 
-	// ─── NEW: DECOUPLED I/O STATE ───
-	SendChan chan *Frame // Technical: The outbound mailbox. The Loader (writeLoop) pulls from here.
-
+	// ─── UPDATED: TYPE-AWARE CODES ───
+	// SendChan acts as the thread-safe outbound mailbox. The background WriteLoop
+	// pulls packets from here and marshals them into raw wire frames.
+	SendChan chan *protocol.Packet
 }
 
 // NewConnection initializes a monitored connection wrapper.
@@ -32,7 +36,8 @@ func NewConnection(id string, conn net.Conn) *Connection {
 		id:         id,
 		createdAt:  time.Now(),
 		closedChan: make(chan struct{}),
-		SendChan:   make(chan *Frame, 100), // Buffered to allow up to 100 frames to queue before blocking the sender.
+		// Buffered to allow up to 100 type-validated packets to queue before blocking the sender.
+		SendChan: make(chan *protocol.Packet, 100),
 	}
 }
 
@@ -70,4 +75,86 @@ func (c *Connection) Close() error {
 // Provides a sensor hook that allows warehouse subsystems to check if this truck's siren has gone off.
 func (c *Connection) Done() <-chan struct{} {
 	return c.closedChan
+}
+
+// ReadLoop acts as the dedicated Unloader.
+func (c *Connection) ReadLoop(packetInboundChan chan<- *protocol.Packet, idleTimeout time.Duration) {
+	// Defensively ensure the connection is torn down when the reader breaks out
+	defer c.Close()
+
+	for {
+		// 1. Defend Against Idle/Stalled Senders (Slowloris Protection)
+		if idleTimeout > 0 {
+			if err := c.Conn.SetReadDeadline(time.Now().Add(idleTimeout)); err != nil {
+				// Kernel-level failure setting socket options; log and abort
+				return
+			}
+		}
+
+		// 2. Stream-Parse the Inbound Wire Frame
+		packet, err := protocol.UnmarshalPacket(c.Conn)
+		if err != nil {
+			// Evaluate the structural severity of the error
+			switch {
+			case errors.Is(err, io.EOF):
+				// Analogy: The truck driver signaled they are finished and unhooked cleanly.
+				return
+
+			case errors.Is(err, protocol.ErrPayloadTooLarge):
+				// 🛡️ SECURITY BREACH TRAP: A client is trying to crash our engine via buffer expansion.
+				// We drop the connection instantly without waiting for a graceful flush.
+				return
+
+			case errors.Is(err, protocol.ErrInvalidPacket):
+				// WIRE INTEGRITY FAULT: The client sent truncated data or wire corruption occurred.
+				return
+
+			default:
+				// Catch generic network dropping/kernel resets (e.g., "connection reset by peer")
+				return
+			}
+		}
+
+		// 3. Route the Validated Frame Upstream to the Central Switchboard
+		select {
+		case packetInboundChan <- packet:
+			// Packet safely handed off to the internal routing engine
+		case <-c.closedChan:
+			// The connection lifecycle was terminated externally; cease processing
+			return
+		}
+	}
+}
+
+// WriteLoop acts as the dedicated Loader.
+func (c *Connection) WriteLoop(writeTimeout time.Duration) {
+	// Ensure cleanup occurs if the write loop exits
+	defer c.Close()
+
+	for {
+		select {
+		case <-c.closedChan:
+			// Truck is leaving the loading bay; shut down the worker safely
+			return
+
+		case packet, ok := <-c.SendChan:
+			if !ok {
+				// The outbound mailbox channel was closed internally
+				return
+			}
+
+			// 1. Enforce Write Deadlines to protect against un-responsive receivers
+			if writeTimeout > 0 {
+				if err := c.Conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+					return
+				}
+			}
+
+			// 2. Serialize the Packet directly onto the Net Connection Wire
+			if err := packet.Marshal(c.Conn); err != nil {
+				// If writing to the socket fails, the link is broken. Drop out.
+				return
+			}
+		}
+	}
 }

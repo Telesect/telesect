@@ -3,12 +3,12 @@ package transport
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
-	"io"
 	"net"
 	"sync"
 	"time"
+
+	"telesect/pkg/protocol"
 )
 
 // Server handles listening for and orchestrating incoming raw TCP streams.
@@ -25,14 +25,20 @@ type Server struct {
 	mu          sync.RWMutex           // Technical: Asymmetric read/write lock protecting the registry map. Analogy: Master lock box on the registry directory.
 	connections map[string]*Connection // Technical: Thread-unsafe map mapping client IDs to connection pointers. Analogy: The central directory board.
 	isShutdown  bool                   // Technical: Flag preventing duplicate operations. Analogy: State sign displaying "Closed".
+
+	// ─── NEW MASTER SWITCHBOARD ───
+	// Technical: The centralized channel where all isolated ReadLoops push their validated packets.
+	// Analogy: The main facility conveyor belt where all trucks dump their unloaded, inspected cargo.
+	InboundRouter chan *protocol.Packet
 }
 
 // NewServer initializes a server instance attached to an address with an active registry map.
 func NewServer(addr string) *Server {
 	return &Server{
-		addr:        addr,
-		shutdown:    make(chan struct{}),
-		connections: make(map[string]*Connection), // Technical: Must initialize map memory space to avoid nil panics.
+		addr:          addr,
+		shutdown:      make(chan struct{}),
+		connections:   make(map[string]*Connection),      // Technical: Must initialize map memory space to avoid nil panics.
+		InboundRouter: make(chan *protocol.Packet, 1000), // Buffer size of 1000 provides massive backpressure relief
 	}
 }
 
@@ -94,11 +100,11 @@ func (s *Server) handleRawStream(rawConn net.Conn) {
 	fmt.Printf("[Server Context] Inbound socket assigned identity: %s (Remote: %s)\n", conn.ID(), conn.RemoteAddr())
 
 	// Spin up the Loader on its own isolated background thread
-	go s.writeLoop(conn)
+	go conn.WriteLoop(30 * time.Second)
 
 	// Run the Unloader on this current thread.
 	// This function will block here infinitely until the network disconnects or faults.
-	s.readLoop(conn)
+	conn.ReadLoop(s.InboundRouter, 5*time.Minute)
 }
 
 // ─── NEW THREAD-SAFE REGISTRY METHODS ───
@@ -177,59 +183,4 @@ func generateID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(bytes), nil
-}
-
-// writeLoop acts as the dedicated Loader.
-// ─── TECHNICAL ───
-// It listens on the internal SendChan for outbound payloads and multiplexes them onto the raw socket.
-// It uses a select statement to listen for the shutdown broadcast simultaneously.
-func (s *Server) writeLoop(conn *Connection) {
-	// Technical: If the write loop exits for any reason, trigger the safety clamp.
-	defer conn.Close()
-
-	for {
-		select {
-		case <-conn.Done():
-			// Analogy: The alarm siren went off. Stop loading and exit the facility.
-			return
-		case frame := <-conn.SendChan:
-			// Analogy: A package arrived on the internal conveyor belt. Push it out to the truck.
-			if err := frame.Marshal(conn); err != nil {
-				fmt.Printf("[Write Fault] Client %s: %v\n", conn.ID(), err)
-				return
-			}
-		}
-	}
-}
-
-// readLoop acts as the dedicated Unloader.
-// ─── TECHNICAL ───
-// It continuously polls the network socket for inbound binary frames. Because socket reads are blocking,
-// separating this ensures outbound telemetry or data can still flow even if the client goes quiet.
-func (s *Server) readLoop(conn *Connection) {
-	// Technical: If the unloader hits a network drop or parsing error, trigger the safety clamp.
-	defer conn.Close()
-
-	for {
-		// Enforce the 5-minute inactivity timeout.
-		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
-
-		frame, err := UnmarshalRead(conn)
-		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
-				fmt.Printf("[Server Context] Connection cleanly torn down for client: %s\n", conn.ID())
-				return
-			}
-			fmt.Printf("[Server Context] Protocol framing violation or error on client %s: %v\n", conn.ID(), err)
-			return
-		}
-
-		// For Milestone 1.3, we simply log the successful extraction.
-		// In Phase 2, we will route this frame into the TUI Ring Buffers.
-		fmt.Printf("[Protocol Ingress] Stream: %d | Type: 0x%02x | Sizing: %d bytes | Source: %s\n",
-			frame.StreamID, frame.Type, frame.Length, conn.ID())
-		if frame.Length > 0 {
-			fmt.Printf("[Payload Content] -> %s\n", string(frame.Payload))
-		}
-	}
 }
