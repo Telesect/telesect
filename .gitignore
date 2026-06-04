@@ -1,0 +1,13 @@
+# Binaries and tools
+bin/
+dist/
+/telesectd
+
+# Test coverage and profiles
+*.out
+*.prof
+*.test
+
+# Local development overrides
+.env
+.DS_Store
