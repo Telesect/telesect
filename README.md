@@ -52,10 +52,11 @@ Telesect is an integrated, low-overhead communication backbone and operational e
 ## Protocol Framing Format
 Telesect utilizes a rigid, low-overhead binary layout consisting of a 7-byte fixed header followed by a variable length payload:
 
+```bash
 +-------------------+--------------------+--------------------+-----------------------+
 |  Stream ID (4B)   |     Type (1B)      |    Length (2B)     |   Payload (Variable)  |
 +-------------------+--------------------+--------------------+-----------------------+
-
+```
 - Stream ID (4 Bytes): Big-endian unsigned integer representing the virtual sub-channel.
 
 - Type (1 Byte): Protocol control or payload identifier.
