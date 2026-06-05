@@ -22,20 +22,24 @@ Telesect is an integrated, low-overhead communication backbone and operational e
 - [x] Thread-Safe Registry Switchboard (`sync.RWMutex` protected)
 - [x] Graceful Signal Trapping (SIGINT/SIGTERM) and Controlled Cascading Teardown
 
-### 🎛️ Phase 2: The Protocol & Framing Layer — **[IN PROGRESS]**
+### 🎛️ Phase 2: The Protocol & Framing Layer — **[COMPLETE]**
 - [x] **Milestone 2.1 — TLV Binary Framing & Hardening**
   - [x] Implement rigid 5-byte wire contract with Network Byte Order (Big-Endian) serialization.
   - [x] Build defensive OOM mitigation and maximum frame ceiling validation checks.
   - [x] Route validated packet ingress streams to the central master `InboundRouter` switchboard channel.
-- [ ] **Milestone 2.2 — Application-Layer Flow Control & Backpressure**
-  - [ ] Introduce explicit Control Frames (`0x05 WINDOW_UPDATE`).
-  - [ ] Implement queue saturation tracking and upstream execution throttling.
+- [x] **Milestone 2.2 — Application-Layer Flow Control & Backpressure**
+  - [x] Introduce explicit Control Frames (`0x05 WINDOW_UPDATE`).
+  - [x] Implement queue saturation tracking and upstream execution throttling.
 - [x] **Milestone 2.3 — Measurement & Profiling Baseline**
   - [x] Establish high-throughput micro-benchmarks (`go test -bench -benchmem`).
-  - [ ] Profile hot paths using `pprof` and optimize allocations using pooling strategies *after* Milestone 2.2.
+  - [x] Profile hot paths using `pprof` and optimize allocations using pooling strategies (`sync.Pool` and fixed-size slice arrays).
 
-### 📊 Phase 3: Native Telemetry Pipeline — **[BACKLOG]**
-### 🔒 Phase 4: TLS / Cryptographic Handshake Layer — **[BACKLOG]**
+### 🔒 Phase 3: The Secure Trust Layer — **[UP NEXT]**
+- [ ] Milestone 3.1 — mTLS Transport & Identity Binding
+- [ ] Milestone 3.2 — Stream-Level Role-Based Access Control (RBAC)
+- [ ] Milestone 3.3 — Perimeter Defenses & Traffic Operations
+
+### 📊 Phase 4: Native Telemetry & TUI Control Plane — **[BACKLOG]**
 
 ---
 
@@ -73,15 +77,21 @@ Telesect is an integrated, low-overhead communication backbone and operational e
 +-----------+-----------------------+-----------------------+
 ```
 
-- Type (1 Byte / Offset 0): Transparent routing identifier separating internal control signals from application traffic vectors.
+- Type (1 Byte / Offset 0): A transparent routing identifier. The engine enforces a strict boundary between internal transport operations and external application payloads.
 
-   - 0x01 - Control Plane Signal
+   - 0x00 - 0x0F (Internal Engine Reserved): Exclusively intercepted and processed by the transport layer. External applications never see these.
 
-   - 0x02 - Agritech/Telemetry Data Vector
+      - Active: 0x05 - Window Update / Flow Control Frame.
 
-   - 0x05 - Window Update / Flow Control Frame
+- 0x10 - 0xFF (Application Space): 100% payload-agnostic. The engine transparently routes these to the central switchboard. Developers define their own contracts here.
 
-- Length (4 Bytes / Offsets 1-4): Big-endian 32-bit unsigned integer defining the explicit sizing boundaries of the trailing payload.
+   - Example Use Case: 0x10 - Health/Diagnostic Service
+
+   - Example Use Case: 0x11 - Agritech/Telemetry Data Vector
+
+   - Example Use Case: 0x12 - TUI Control Plane Command
+
+- Length (4 Bytes / Offsets 1-4): Big-endian 32-bit unsigned integer defining the explicit sizing boundaries of the trailing payload (Max: 16MB).
 
 - Value (Variable Sizing / Offset 5+): Raw application or network command bytes.
 
@@ -99,6 +109,19 @@ To respect Architectural Pillar #3, performance mutations are logged systematica
    - Memory Overhead: 138 B/op
 
    - Heap Allocations: 4 allocs/op
+
+### Optimized Run: Milestone 2.3 Complete (Zero-Allocation Hot Path)
+- Environment: AMD Ryzen 3 3250U (4 Logical Threads), Linux amd64
+
+- Metrics:
+
+   - Latency: 26,118 ns/op
+
+   - Memory Overhead: 0 B/op
+
+   - Heap Allocations: 0 allocs/op
+
+Notes: Achieved via sync.Pool packet recycling and fixed-size struct slice arrays for header bounds checking.
   
 ## License
 Telesect is open-source software licensed under the Apache License, Version 2.0. See the LICENSE file for full details.

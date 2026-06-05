@@ -21,7 +21,10 @@ func BenchmarkServer_Throughput(b *testing.B) {
 	// This prevents the channel buffer (1000) from filling up and stalling the engine.
 	go func() {
 		for range srv.InboundRouter {
-			// Intentionally do nothing with the packet to isolate core network performance.
+			for packet := range srv.InboundRouter {
+				// ─── NEW: RECYCLE THE PACKET IMMEDIATELY ───
+				packet.Release()
+			}
 		}
 	}()
 
@@ -48,9 +51,13 @@ func BenchmarkServer_Throughput(b *testing.B) {
 	// 6. Reset the timer to ignore all the setup and network dial overhead
 	b.ResetTimer()
 
+	// ─── NEW: Declare a scratchpad for the benchmark loop ───
+	var scratch [protocol.HeaderSize]byte
+
 	// 7. Execute the hot-path loop b.N times
 	for i := 0; i < b.N; i++ {
-		if err := packet.Marshal(clientConn); err != nil {
+		// Pass the scratchpad slice here
+		if err := packet.Marshal(clientConn, scratch[:]); err != nil {
 			b.Fatalf("Iteration %d failed to marshal packet to wire: %v", i, err)
 		}
 	}

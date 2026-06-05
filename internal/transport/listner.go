@@ -50,8 +50,9 @@ func (s *Server) Start() error {
 	}
 	s.listener = l
 
-	s.wg.Add(1)
+	s.wg.Add(2)
 	go s.acceptLoop()
+	go s.monitorBackpressure() // ─── NEW: BACKPRESSURE WATCHDOG ───
 
 	return nil
 }
@@ -183,4 +184,61 @@ func generateID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(bytes), nil
+}
+
+// monitorBackpressure continuously reviews the saturation of the InboundRouter channel.
+// If thresholds are violated, it issues network control frames to throttle incoming streams.
+func (s *Server) monitorBackpressure() {
+	defer s.wg.Done()
+
+	// Using a ticker avoids a tight, CPU-burning loop. Checks capacity every 5 milliseconds.
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+
+	var isPaused bool
+
+	for {
+		select {
+		case <-s.shutdown:
+			return
+		case <-ticker.C:
+			currentLength := len(s.InboundRouter)
+
+			// 80% of 1000 buffer capacity = 800 packets
+			if currentLength >= 800 && !isPaused {
+				isPaused = true
+				fmt.Printf("[ALARM] InboundRouter saturated (%d/1000). Broadcasting PAUSE to all nodes.\n", currentLength)
+				s.broadcastFlowControl(protocol.WindowStatePause)
+			}
+
+			// 20% low-water mark reset = 200 packets
+			if currentLength <= 200 && isPaused {
+				isPaused = false
+				fmt.Printf("[CLEAR] InboundRouter drained (%d/1000). Broadcasting RESUME to all nodes.\n", currentLength)
+				s.broadcastFlowControl(protocol.WindowStateResume)
+			}
+		}
+	}
+}
+
+// broadcastFlowControl manufactures a 0x05 internal packet and queues it out to every active connection.
+func (s *Server) broadcastFlowControl(state byte) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Forge the internal control packet
+	controlPacket, err := protocol.NewPacket(protocol.TypeWindowUpdate, []byte{state})
+	if err != nil {
+		return
+	}
+
+	// Fan-out the packet directly to the WriteLoop outboxes
+	for _, conn := range s.connections {
+		select {
+		case conn.SendChan <- controlPacket:
+		default:
+			// If a single client's send buffer is completely hard-locked, skip them to prevent
+			// stalling the entire server's broadcast loop.
+		}
+	}
 }

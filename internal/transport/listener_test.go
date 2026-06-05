@@ -36,8 +36,11 @@ func TestServer_PacketIngress(t *testing.T) {
 	}
 	mockPacket.Length = uint32(len(mockPacket.Value))
 
+	// ─── NEW: Declare a scratchpad for the test ───
+	var scratch [protocol.HeaderSize]byte
+
 	// 4. Serialize and transmit the packet directly over the network wire
-	if err := mockPacket.Marshal(clientConn); err != nil {
+	if err := mockPacket.Marshal(clientConn, scratch[:]); err != nil {
 		t.Fatalf("Client failed to serialize and transmit packet: %v", err)
 	}
 
@@ -54,6 +57,9 @@ func TestServer_PacketIngress(t *testing.T) {
 		if string(receivedPacket.Value) != string(mockPacket.Value) {
 			t.Errorf("Payload corruption detected: expected %q, got %q", string(mockPacket.Value), string(receivedPacket.Value))
 		}
+
+		// ─── NEW: CLEAN UP AND RECYCLE ───
+		receivedPacket.Release()
 
 	case <-time.After(2 * time.Second):
 		t.Fatal("Timeout violation: Server connection workers failed to route packet to master switchboard within 2s")

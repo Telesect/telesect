@@ -18,14 +18,15 @@ func TestPacket_MarshalUnmarshal_HappyPath(t *testing.T) {
 
 	// Use a bytes.Buffer to simulate our low-overhead TCP pipe
 	var stream bytes.Buffer
+	var scratch [HeaderSize]byte // ─── NEW SCRATCHPAD ───
 
 	// Serialize into the stream
-	if err := packet.Marshal(&stream); err != nil {
+	if err := packet.Marshal(&stream, scratch[:]); err != nil {
 		t.Fatalf("Failed to marshal packet: %v", err)
 	}
 
 	// Deserialize out of the stream
-	parsedPacket, err := UnmarshalPacket(&stream)
+	parsedPacket, err := UnmarshalPacket(&stream, scratch[:])
 	if err != nil {
 		t.Fatalf("Failed to unmarshal packet: %v", err)
 	}
@@ -40,6 +41,9 @@ func TestPacket_MarshalUnmarshal_HappyPath(t *testing.T) {
 	if !bytes.Equal(parsedPacket.Value, payload) {
 		t.Errorf("Payload mismatch. Expected %s, got %s", payload, parsedPacket.Value)
 	}
+
+	// ─── NEW: CLEAN UP AND RECYCLE ───
+	parsedPacket.Release()
 }
 
 // TestUnmarshalPacket_OOMDefense guarantees that if a malicious payload size
@@ -55,10 +59,9 @@ func TestUnmarshalPacket_OOMDefense(t *testing.T) {
 	binary.BigEndian.PutUint32(hugeLengthBytes, 400*1024*1024)
 	maliciousStream.Write(hugeLengthBytes)
 
-	// Attempt to unmarshal the malicious stream frame
-	_, err := UnmarshalPacket(&maliciousStream)
+	var scratch [HeaderSize]byte // ─── NEW SCRATCHPAD ───
+	_, err := UnmarshalPacket(&maliciousStream, scratch[:])
 
-	// Verify the engine intercepts the execution vector cleanly
 	if !errors.Is(err, ErrPayloadTooLarge) {
 		t.Errorf("Security flaw: Expected ErrPayloadTooLarge, got %v", err)
 	}
@@ -78,7 +81,8 @@ func TestUnmarshalPacket_TruncatedStream(t *testing.T) {
 	// MALICIOUS OR BROKEN DELAY: Only send 3 bytes of data instead of the promised 10
 	corruptedStream.Write([]byte{0xA, 0xB, 0xC})
 
-	_, err := UnmarshalPacket(&corruptedStream)
+	var scratch [HeaderSize]byte // ─── NEW SCRATCHPAD ───
+	_, err := UnmarshalPacket(&corruptedStream, scratch[:])
 
 	if !errors.Is(err, ErrInvalidPacket) {
 		t.Errorf("Expected ErrInvalidPacket for truncated wire stream, got %v", err)

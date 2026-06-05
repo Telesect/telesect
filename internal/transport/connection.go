@@ -2,6 +2,7 @@ package transport
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -27,6 +28,16 @@ type Connection struct {
 	// SendChan acts as the thread-safe outbound mailbox. The background WriteLoop
 	// pulls packets from here and marshals them into raw wire frames.
 	SendChan chan *protocol.Packet
+
+	// ─── NEW: INTERNAL FLOW CONTROL ───
+	// FlowControlChan acts as the direct brake pedal for the WriteLoop.
+	// It carries the 1-byte state flags (0x00 Pause, 0x01 Resume).
+	FlowControlChan chan byte
+
+	// ─── NEW: ZERO-ALLOCATION SCRATCH BUFFERS ───
+	// Allocated once per connection lifetime. Completely eliminates header heap generation.
+	readScratch  [protocol.HeaderSize]byte
+	writeScratch [protocol.HeaderSize]byte
 }
 
 // NewConnection initializes a monitored connection wrapper.
@@ -38,6 +49,8 @@ func NewConnection(id string, conn net.Conn) *Connection {
 		closedChan: make(chan struct{}),
 		// Buffered to allow up to 100 type-validated packets to queue before blocking the sender.
 		SendChan: make(chan *protocol.Packet, 100),
+		// Buffered to 10 to ensure the engine can rapidly shift states without blocking
+		FlowControlChan: make(chan byte, 10),
 	}
 }
 
@@ -91,13 +104,12 @@ func (c *Connection) ReadLoop(packetInboundChan chan<- *protocol.Packet, idleTim
 			}
 		}
 
-		// 2. Stream-Parse the Inbound Wire Frame
-		packet, err := protocol.UnmarshalPacket(c.Conn)
+		// 2. ─── UPDATED: PASS THE SCRATCHPAD ───
+		// Pass c.readScratch[:] to bypass interface escape analysis.
+		packet, err := protocol.UnmarshalPacket(c.Conn, c.readScratch[:])
 		if err != nil {
-			// Evaluate the structural severity of the error
 			switch {
 			case errors.Is(err, io.EOF):
-				// Analogy: The truck driver signaled they are finished and unhooked cleanly.
 				return
 
 			case errors.Is(err, protocol.ErrPayloadTooLarge):
@@ -115,7 +127,23 @@ func (c *Connection) ReadLoop(packetInboundChan chan<- *protocol.Packet, idleTim
 			}
 		}
 
-		// 3. Route the Validated Frame Upstream to the Central Switchboard
+		// 3. 🛡️ NEW: INTERCEPT RESERVED INTERNAL ENGINE CONTROL FRAMES
+		if packet.Type == protocol.TypeWindowUpdate {
+			if len(packet.Value) > 0 {
+				stateSignal := packet.Value[0]
+				select {
+				case c.FlowControlChan <- stateSignal:
+					// Signal successfully handed off to our local WriteLoop brake pedal
+				case <-c.closedChan:
+					return
+				}
+			}
+			// CRITICAL: Continue the loop immediately!
+			// This drops the 0x05 frame so it NEVER reaches the user's application-layer InboundRouter.
+			continue
+		}
+
+		// 4. Route the Validated Application Frame Upstream to the Central Switchboard
 		select {
 		case packetInboundChan <- packet:
 			// Packet safely handed off to the internal routing engine
@@ -126,10 +154,15 @@ func (c *Connection) ReadLoop(packetInboundChan chan<- *protocol.Packet, idleTim
 	}
 }
 
-// WriteLoop acts as the dedicated Loader.
+// WriteLoop acts as the dedicated Loader, now equipped with Application-Layer Flow Control.
 func (c *Connection) WriteLoop(writeTimeout time.Duration) {
 	// Ensure cleanup occurs if the write loop exits
 	defer c.Close()
+
+	// ─── NEW: THE THROTTLE STATE ───
+	// activeSendChan controls whether we are pulling application packets.
+	// It starts fully operational (unpaused), pointing directly to the user's outbox.
+	activeSendChan := c.SendChan
 
 	for {
 		select {
@@ -137,22 +170,36 @@ func (c *Connection) WriteLoop(writeTimeout time.Duration) {
 			// Truck is leaving the loading bay; shut down the worker safely
 			return
 
-		case packet, ok := <-c.SendChan:
+		// ─── NEW: ENGINE CONTROL LISTENER ───
+		case state := <-c.FlowControlChan:
+			if state == protocol.WindowStatePause {
+				// ENGAGE BRAKES: Setting to nil disables the case below.
+				// User data safely piles up in c.SendChan without being processed.
+				activeSendChan = nil
+				fmt.Printf("[Flow Control] %s triggered BACKPRESSURE PAUSE.\n", c.id)
+
+			} else if state == protocol.WindowStateResume {
+				// RELEASE BRAKES: Restore the pointer to the real channel.
+				activeSendChan = c.SendChan
+				fmt.Printf("[Flow Control] %s triggered BACKPRESSURE RESUME.\n", c.id)
+			}
+
+			// ─── MODIFIED: ACTIVE SEND CHANNEL ───
+			// Notice this now ranges over activeSendChan, NOT c.SendChan directly.
+		case packet, ok := <-activeSendChan:
 			if !ok {
-				// The outbound mailbox channel was closed internally
 				return
 			}
 
-			// 1. Enforce Write Deadlines to protect against un-responsive receivers
 			if writeTimeout > 0 {
 				if err := c.Conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
 					return
 				}
 			}
 
-			// 2. Serialize the Packet directly onto the Net Connection Wire
-			if err := packet.Marshal(c.Conn); err != nil {
-				// If writing to the socket fails, the link is broken. Drop out.
+			// 2. ─── UPDATED: PASS THE SCRATCHPAD ───
+			// Serialize using the permanent write buffer to prevent heap allocations.
+			if err := packet.Marshal(c.Conn, c.writeScratch[:]); err != nil {
 				return
 			}
 		}
