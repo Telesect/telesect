@@ -2,12 +2,25 @@
 bin/
 dist/
 /telesectd
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
 
 # Test coverage and profiles
 *.out
 *.prof
 *.test
 
-# Local development overrides
-.env
+
+# MkDocs Build Target
+site/
+
+# Development Environments / Tooling
+.idea/
+.vscode/
+*.swp
+*.swo
 .DS_Store
+.env

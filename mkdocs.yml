@@ -1,0 +1,48 @@
+site_name: Telesect Core Engine
+site_description: Secure, multiplexed communication backbone and telemetry primitive.
+
+theme:
+  name: material
+  palette:
+    # Sleek dark mode toggles out of the box
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: cyan
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: cyan
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+  features:
+    #- navigation.tabs          # Top-level category tabs
+    - navigation.sections      # Sidebar layout sections
+    - code.copy                # Quick copy button on code snippets
+    - content.code.annotate    # Code inline annotations
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+nav:
+  - 1. Introduction: index.md
+  - 2. Architecture Core: architecture.md
+  - 3. Engineering Tenets: tenets.md
+  - 4. Protocol Schema: protocol_schema.md
+  - 5. Flow & Backpressure: flow_backpressure.md
+  - 6. Examples & Guides: examples_guides.md
+  - 7. Contribution Guide: contribution.md

@@ -8,57 +8,55 @@ import (
 )
 
 const (
-	// HeaderSize represents the exact fixed byte length of the protocol header
-	// Type (1 Byte) + Length (4 Bytes) = 5 Bytes
+	// HeaderSize represents the exact fixed byte length of the protocol header.
+	// It consists of Type (1 Byte) + Length (4 Bytes).
 	HeaderSize = 5
 
-	// MaxPayloadSize enforces an aggressive 16MB ceiling on incoming frames.
-	// This directly prevents OOM panics caused by malicious or corrupted length values.
+	// MaxPayloadSize enforces an aggressive 16MB ceiling on incoming frames
+	// to prevent Out-Of-Memory (OOM) panics caused by malicious length values.
 	MaxPayloadSize = 16 * 1024 * 1024 // 16 MB
 )
 
-// ─── INTERNAL ENGINE PROTOCOL IDENTIFIERS (Reserved 0x00 - 0x0F) ───
 const (
-	// TypeWindowUpdate is a reserved INTERNAL engine frame for backpressure flow control.
-	// End-users will never see this packet; the transport layer intercepts it.
+	// TypeWindowUpdate is a reserved internal engine frame for backpressure flow control.
+	// This packet type is intercepted at the transport layer and is invisible to end-users.
 	TypeWindowUpdate byte = 0x05
-
-	// Note: In the future, we might add TypePing = 0x06, TypeHandshake = 0x07, etc.
 )
 
-// ─── INTERNAL FLOW CONTROL STATES ───
 const (
-	// WindowStatePause tells the remote WriteLoop to freeze transmission
+	// WindowStatePause signals the remote WriteLoop to freeze application data transmission.
 	WindowStatePause byte = 0x00
 
-	// WindowStateResume tells the remote WriteLoop to unfreeze transmission
+	// WindowStateResume signals the remote WriteLoop to resume application data transmission.
 	WindowStateResume byte = 0x01
 )
 
 var (
+	// ErrPayloadTooLarge is returned when an incoming or outbound payload exceeds MaxPayloadSize.
 	ErrPayloadTooLarge = errors.New("protocol boundary error: payload size exceeds maximum ceiling")
-	ErrInvalidPacket   = errors.New("protocol integrity error: malformed packet read")
+
+	// ErrInvalidPacket is returned when read data is truncated or violates wire integrity.
+	ErrInvalidPacket = errors.New("protocol integrity error: malformed packet read")
 )
 
-// ─── NEW: THE PACKET RECYCLER POOL ───
+// packetPool manages reusable Packet instances to minimize heap allocation under high throughput.
 var packetPool = sync.Pool{
 	New: func() any {
 		return &Packet{
-			// Pre-allocate a 1KB baseline capacity for the value slice to eliminate
-			// initial allocations for standard agritech telemetry frames.
 			Value: make([]byte, 0, 1024),
 		}
 	},
 }
 
-// Packet represents the rigid Type-Length-Value contract for Telesect routing.
+// Packet represents the Type-Length-Value (TLV) contract for all Telesect routing.
 type Packet struct {
-	Type   byte
-	Length uint32
-	Value  []byte
+	Type   byte   // The operational or application-specific identifier frame.
+	Length uint32 // The explicit size of the payload value in bytes.
+	Value  []byte // The raw underlying binary payload.
 }
 
-// NewPacket constructs a clean, memory-safe Telesect packet wrapper.
+// NewPacket constructs a validated Packet wrapper. It returns ErrPayloadTooLarge
+// if the value byte slice exceeds the internal protocol safety thresholds.
 func NewPacket(pType byte, value []byte) (*Packet, error) {
 	if len(value) > MaxPayloadSize {
 		return nil, ErrPayloadTooLarge
@@ -70,18 +68,17 @@ func NewPacket(pType byte, value []byte) (*Packet, error) {
 	}, nil
 }
 
-// Release zeroes out the packet properties and returns the object to the pool.
-// CRITICAL: The application layer MUST call this once processing is completed.
+// Release zeroes out the Packet fields and returns the instance to the internal sync.Pool.
+// This must be explicitly called by the application layer once processing is complete.
 func (p *Packet) Release() {
 	p.Type = 0
 	p.Length = 0
-	// Truncate length to 0 but retain underlying memory capacity for re-use
 	p.Value = p.Value[:0]
 	packetPool.Put(p)
 }
 
-// Marshal writes the packet out using a pre-allocated header buffer to eliminate heap escapes.
-// The provided 'buf' MUST be at least HeaderSize (5 bytes) in length.
+// Marshal serializes the Packet into an io.Writer using a pre-allocated scratchpad buffer.
+// The provided buf slice must be at least HeaderSize (5 bytes) long to bypass escape analysis.
 func (p *Packet) Marshal(w io.Writer, buf []byte) error {
 	if len(p.Value) > MaxPayloadSize {
 		return ErrPayloadTooLarge
@@ -93,7 +90,6 @@ func (p *Packet) Marshal(w io.Writer, buf []byte) error {
 	buf[0] = p.Type
 	binary.BigEndian.PutUint32(buf[1:5], p.Length)
 
-	// Write out the pre-allocated 5-byte header frame
 	if _, err := w.Write(buf[:HeaderSize]); err != nil {
 		return err
 	}
@@ -106,14 +102,13 @@ func (p *Packet) Marshal(w io.Writer, buf []byte) error {
 	return nil
 }
 
-// UnmarshalPacket extracts a frame using a pre-allocated header buffer to bypass escape analysis.
-// The provided 'buf' MUST be at least HeaderSize (5 bytes) in length.
+// UnmarshalPacket reads a raw byte stream from an io.Reader and extracts a structured Packet.
+// It draws allocations from a sync.Pool and utilizes the provided scratchpad buffer to remain zero-alloc.
 func UnmarshalPacket(r io.Reader, buf []byte) (*Packet, error) {
 	if len(buf) < HeaderSize {
 		return nil, ErrInvalidPacket
 	}
 
-	// Read directly into the provided reuseable scratchpad
 	if _, err := io.ReadFull(r, buf[:HeaderSize]); err != nil {
 		return nil, err
 	}
@@ -125,23 +120,19 @@ func UnmarshalPacket(r io.Reader, buf []byte) (*Packet, error) {
 		return nil, ErrPayloadTooLarge
 	}
 
-	// ─── UPDATED: DRAW PACKET WRAPPER FROM POOL ───
 	pkt := packetPool.Get().(*Packet)
 	pkt.Type = pType
 	pkt.Length = length
 
-	// ─── UPDATED: REUSE OR GROW SLICE MEMORY WITHOUT ALLOCATING ───
 	if length > 0 {
 		if cap(pkt.Value) < int(length) {
-			// Grow backing array if incoming payload breaks current boundary
 			pkt.Value = make([]byte, length)
 		} else {
-			// Reslice existing memory instantly (0 allocs)
 			pkt.Value = pkt.Value[:length]
 		}
 
 		if _, err := io.ReadFull(r, pkt.Value); err != nil {
-			pkt.Release() // Instantly recycle if read fails
+			pkt.Release()
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				return nil, ErrInvalidPacket
 			}
